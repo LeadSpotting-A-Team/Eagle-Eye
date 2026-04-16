@@ -1,0 +1,31 @@
+# --- Project Specific ---
+/sandbox/*
+!/sandbox/.gitkeep
+
+# --- Security & Config ---
+.env            # Secrets and credentials
+*.pem           # Security certificates
+*.key
+
+# --- Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Python Cache ---
+__pycache__/    # Compiled bytecode
+*.py[cod]
+.pytest_cache/
+.coverage       # Test reports
+
+# --- Build & Distribution ---
+dist/
+build/
+*.egg-info/
+
+# --- IDE & System ---
+.vscode/        # Editor settings
+.idea/          # PyCharm settings
+.DS_Store       # macOS system files
+Thumbs.db       # Windows thumbnails
