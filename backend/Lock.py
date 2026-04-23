@@ -2,7 +2,7 @@ import numpy as np
 import cv2 as cv
 from matplotlib import pyplot as plt
  
-img = cv.imread('simple.jpg', cv.IMREAD_GRAYSCALE)
+
  
 
 def The_Lock(reference_image : np.ndarray, new_image : np.ndarray, keypoints_detector = cv.ORB_create()):
