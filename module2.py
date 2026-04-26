@@ -1,14 +1,13 @@
 """
 Eagle-Eye – Module 2 v2: Illumination Invariant Pre-processing (UPGRADED)
 ==========================================================================
-Upgrades over v1:
+Current pipeline:
   - Multi color space: LAB (default), YCbCr, HSV
   - Vectorized NMS via np.roll (no pixel loops)
-  - Adaptive shadow mask: low luminance AND dilated NMS edges
-  - Entropy-driven compensation per LBP class, per BGR channel
-      ent < 5.5  -> Texture-Priority (additive offset)
-      ent >= 5.5 -> Color-Priority  (multiplicative ratio)
-  - Final output: shadow-neutralized RGB image (not a gradient map)
+  - Adaptive shadow mask: low luminance with gradient edge protection
+  - Texture- and edge-aware compensation in LAB luminance space
+  - Structure map for change detection: 0.55*gradient + 0.45*LBP
+  - Final BGR output is for visualization/reporting
   - process_pair: handles two images with all new logic
 
 ProcessedImage.final is now a uint8 BGR shadow-neutralized image.
@@ -60,7 +59,9 @@ class ProcessedImage:
         L_normalized: np.ndarray,
         L_blurred: np.ndarray,
         gradient: np.ndarray,
+        lbp_raw: np.ndarray,
         lbp: np.ndarray,
+        structure_map: np.ndarray,
         shadow_mask: Optional[np.ndarray],
         final: np.ndarray,
         weberface: Optional[np.ndarray] = None,
@@ -70,10 +71,43 @@ class ProcessedImage:
         self.L_normalized = L_normalized
         self.L_blurred    = L_blurred
         self.gradient     = gradient
+        self.lbp_raw      = lbp_raw
         self.lbp          = lbp
+        self.structure_map = structure_map
         self.shadow_mask  = shadow_mask
         self.final        = final
         self.weberface    = weberface
+
+    def to_module3_payload(self) -> dict[str, np.ndarray]:
+        """
+        Stable handoff contract for Module 3.
+
+        Module 3 should compare structure_map as the main change signal.
+        final is intentionally excluded here because it is only for
+        visualization/reporting, not primary change detection.
+        """
+        payload = {
+            "structure_map": self.structure_map,
+            "gradient": self.gradient,
+            "lbp": self.lbp,
+            "shadow_mask": self.shadow_mask,
+            "luminance": self.L_normalized,
+        }
+        self._validate_module3_payload(payload)
+        return payload
+
+    @staticmethod
+    def _validate_module3_payload(payload: dict[str, np.ndarray]) -> None:
+        for name in ("structure_map", "gradient", "lbp", "luminance"):
+            arr = payload[name]
+            if arr.dtype != np.float32:
+                raise TypeError(f"{name} must be float32, got {arr.dtype}")
+            if arr.size and (arr.min() < 0.0 or arr.max() > 1.0):
+                raise ValueError(f"{name} must be in [0,1]")
+
+        shadow_mask = payload["shadow_mask"]
+        if shadow_mask.dtype not in (np.uint8, bool, np.bool_):
+            raise TypeError(f"shadow_mask must be uint8 or bool, got {shadow_mask.dtype}")
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +146,13 @@ class Module2Processor:
     shadow_threshold_ratio : float
         Pixels with L < ratio*mean(L) are shadow candidates.
     entropy_threshold : float
-        Boundary between Texture-Priority and Color-Priority compensation.
+        Texture entropy scale used to reduce correction in detailed regions.
+    max_shadow_coverage : float
+        If the mask covers more than this fraction, correction is reduced.
+    edge_percentile : float
+        Gradient percentile used for edge protection in shadow detection.
+    correction_strength_scale : float
+        Global multiplier for LAB luminance correction.
     enable_weberface : bool
     """
 
@@ -130,6 +170,9 @@ class Module2Processor:
         shadow_threshold_ratio: float = 0.6,
         entropy_threshold: float = 5.5,
         enable_weberface: bool = True,
+        max_shadow_coverage: float = 0.35,
+        edge_percentile: float = 85.0,
+        correction_strength_scale: float = 1.0,
     ) -> None:
         if color_space not in _CS_MAP:
             raise ValueError(f"color_space must be one of {list(_CS_MAP)}")
@@ -146,6 +189,9 @@ class Module2Processor:
         self.shadow_threshold_ratio = shadow_threshold_ratio
         self.entropy_threshold     = entropy_threshold
         self.enable_weberface      = enable_weberface
+        self.max_shadow_coverage   = max_shadow_coverage
+        self.edge_percentile       = edge_percentile
+        self.correction_strength_scale = correction_strength_scale
         self._lbp_table            = self._build_lbp_table(lbp_n_points)
         print(f"[Module 2] color_space={color_space}  entropy_thresh={entropy_threshold}")
 
@@ -157,6 +203,28 @@ class Module2Processor:
         self, img_a: np.ndarray, img_b: np.ndarray
     ) -> Tuple[ProcessedImage, ProcessedImage]:
         return self._run(img_a), self._run(img_b)
+
+    def process_pair_for_module3(self, img_a: np.ndarray, img_b: np.ndarray) -> dict:
+        """
+        Process an aligned image pair and return Module 3-ready arrays.
+
+        Module 3 should compare structure_map, not original RGB images.
+        The final BGR images are included only under debug for reporting.
+        """
+        if img_a.shape != img_b.shape:
+            raise ValueError(
+                f"Module 2 expects aligned same-shape images, got {img_a.shape} and {img_b.shape}"
+            )
+
+        pa, pb = self.process_pair(img_a, img_b)
+        return {
+            "image_a": pa.to_module3_payload(),
+            "image_b": pb.to_module3_payload(),
+            "debug": {
+                "a_final_bgr": pa.final,
+                "b_final_bgr": pb.final,
+            },
+        }
 
     def process_single(self, img_bgr: np.ndarray) -> ProcessedImage:
         return self._run(img_bgr)
@@ -183,16 +251,19 @@ class Module2Processor:
         gradient = _norm01(nms)
 
         # 5 – LBP (skimage)
-        lbp_map = self._lbp(L_blur)
+        lbp_raw, lbp_vis = self._lbp(L_blur)
+        structure_map = self._structure_map(gradient, lbp_vis)
 
         # 8 – Weberface (computed early to aid shadow detection/compensation)
         weberface = self._weberface(L_blur) if self.enable_weberface else None
 
         # 6 – Adaptive shadow mask (now uses morphological closing & weberface)
-        shadow_mask = self._adaptive_shadow_mask(L_raw, nms, weberface)
+        shadow_mask = self._adaptive_shadow_mask(L_raw, nms, lbp_vis, weberface)
 
-        # 7 – Entropy-driven compensation (all BGR channels, cross-referenced with weberface)
-        compensated = self._compensate(img_f32, L_raw, lbp_map, shadow_mask, weberface)
+        # 7 – Texture- and edge-aware compensation in LAB luminance space
+        compensated = self._compensate(
+            img_f32, L_raw, lbp_raw, gradient, shadow_mask, weberface
+        )
         final_bgr = np.clip(compensated * 255.0, 0, 255).astype(np.uint8)
 
         return ProcessedImage(
@@ -201,7 +272,9 @@ class Module2Processor:
             L_normalized=L_norm,
             L_blurred=L_blur,
             gradient=gradient,
-            lbp=lbp_map,
+            lbp_raw=lbp_raw,
+            lbp=lbp_vis,
+            structure_map=structure_map,
             shadow_mask=(shadow_mask.astype(np.uint8) * 255),
             final=final_bgr,
             weberface=weberface,
@@ -265,45 +338,95 @@ class Module2Processor:
             nb2 = np.roll(np.roll(mag, r2, axis=0), c2, axis=1)
             mask = (bin_idx == k) & (mag >= nb1) & (mag >= nb2)
             suppressed[mask] = mag[mask]
+        suppressed[0, :] = 0
+        suppressed[-1, :] = 0
+        suppressed[:, 0] = 0
+        suppressed[:, -1] = 0
         return suppressed.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Step 5 – LBP (skimage)
     # ------------------------------------------------------------------
 
-    def _lbp(self, L: np.ndarray) -> np.ndarray:
+    def _lbp(self, L: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         raw = local_binary_pattern(
             _f2u(L), P=self.lbp_n_points,
             R=self.lbp_radius, method=self.lbp_method,
         ).astype(np.float32)
-        return _norm01(raw)
+        return raw, _norm01(raw)
+
+    @staticmethod
+    def _structure_map(gradient: np.ndarray, lbp_vis: np.ndarray) -> np.ndarray:
+        return _norm01(0.55 * gradient + 0.45 * lbp_vis)
 
     # ------------------------------------------------------------------
     # Step 6 – Adaptive shadow mask
     # ------------------------------------------------------------------
 
     def _adaptive_shadow_mask(
-        self, L: np.ndarray, nms: np.ndarray, weberface: Optional[np.ndarray] = None
+        self,
+        L: np.ndarray,
+        nms: np.ndarray,
+        lbp: np.ndarray,
+        weberface: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
-        Clean, simple, and highly accurate shadow masking.
+        Build a shadow mask from low luminance while protecting structural edges.
+
+        Strong NMS gradients usually indicate real object boundaries. Removing
+        them from the seed mask helps avoid treating dark objects or pits as
+        pure lighting artifacts.
         """
         avg_L = float(L.mean())
-        # Shadow pixels are significantly darker than the mean
-        low_lum = L < (self.shadow_threshold_ratio * avg_L)
+        dark_ref = float(np.percentile(L, 35))
+        low_lum = L < min(self.shadow_threshold_ratio * avg_L, dark_ref)
 
-        # 1. Start with purely dark pixels
-        base_shadow = low_lum.astype(np.uint8) * 255
+        grad_norm = _norm01(nms)
+        structure_map = 0.6 * grad_norm + 0.4 * lbp
+        shadow_seed = low_lum & (grad_norm < 0.12) & (structure_map < 0.20)
+        base_shadow = shadow_seed.astype(np.uint8) * 255
 
-        # 2. Clean up small noise (e.g., dark spots that aren't shadows)
         kernel = np.ones((3, 3), np.uint8)
         shadow_cleaned = cv2.morphologyEx(base_shadow, cv2.MORPH_OPEN, kernel)
 
-        # 3. Fill small holes inside the shadow
         close_kernel = np.ones((9, 9), np.uint8)
         shadow_filled = cv2.morphologyEx(shadow_cleaned, cv2.MORPH_CLOSE, close_kernel)
-        
-        return shadow_filled > 0
+        shadow_filled = cv2.dilate(shadow_filled, kernel, iterations=1)
+        shadow_filled = np.where(low_lum, shadow_filled, 0).astype(np.uint8)
+
+        num_labels, labels = cv2.connectedComponents((shadow_filled > 0).astype(np.uint8))
+        shadow_mask = np.zeros_like(low_lum, dtype=bool)
+        for i in range(1, num_labels):
+            s_mask = labels == i
+            area = int(s_mask.sum())
+            if area < 100:
+                continue
+
+            edge_ratio = float((grad_norm[s_mask] > 0.15).mean())
+            if edge_ratio > 0.05:
+                continue
+
+            if float(structure_map[s_mask].mean()) > 0.25:
+                continue
+
+            ys, xs = np.where(s_mask)
+            h = int(ys.max() - ys.min() + 1)
+            w = int(xs.max() - xs.min() + 1)
+            if h == 0 or w == 0:
+                continue
+            if max(h / w, w / h) <= 2.5:
+                continue
+
+            shadow_mask |= s_mask
+
+        shadow_mask = cv2.erode(
+            shadow_mask.astype(np.uint8), kernel, iterations=1
+        ) > 0
+
+        if shadow_mask.mean() > self.max_shadow_coverage:
+            shadow_mask = np.zeros_like(shadow_mask, dtype=bool)
+
+        return shadow_mask
 
     # ------------------------------------------------------------------
     # Step 7 – Entropy-driven shadow compensation
@@ -313,66 +436,93 @@ class Module2Processor:
     def _entropy(values: np.ndarray) -> float:
         if values.size == 0:
             return 0.0
-        hist, _ = np.histogram(values, bins=256, range=(0.0, 1.0))
-        hist = hist[hist > 0].astype(np.float64)
-        return float(scipy_entropy(hist / hist.sum(), base=2))
+        _, counts = np.unique(values.astype(np.int32), return_counts=True)
+        probs = counts.astype(np.float64) / counts.sum()
+        return float(scipy_entropy(probs, base=2))
 
     def _compensate(
         self,
         img_f32: np.ndarray,
         L: np.ndarray,
-        lbp_map: np.ndarray,
+        lbp_raw: np.ndarray,
+        gradient: np.ndarray,
         shadow_mask: np.ndarray,
         weberface: Optional[np.ndarray],
     ) -> np.ndarray:
         """
-        Direct Channel-Wise Gain in BGR space.
-        Naturally corrects intensity, color shift, and preserves texture contrast.
+        LAB-luminance local compensation with texture and edge confidence.
+
+        Smooth, low-entropy shadow regions receive stronger correction. Highly
+        textured or edge-heavy regions receive conservative correction so the
+        reflectance structure is not flattened into a bright patch. Chroma is
+        preserved to avoid artificial BGR color casts.
         """
-        compensated = img_f32.copy()
         shadow_u8 = shadow_mask.astype(np.uint8)
         
         if not shadow_mask.any():
-            return compensated
+            return img_f32.copy()
+
+        img_u8 = np.clip(img_f32 * 255.0, 0, 255).astype(np.uint8)
+        lab = cv2.cvtColor(img_u8, cv2.COLOR_BGR2LAB)
+        lab_f32 = lab.astype(np.float32)
+        lab_l = lab_f32[:, :, 0] / 255.0
+        illumination_delta = np.zeros_like(lab_l, dtype=np.float32)
             
-        # Sharp feathering
-        soft_shadow = cv2.GaussianBlur(shadow_u8.astype(np.float32), (7, 7), 0)
+        soft_shadow = cv2.GaussianBlur(shadow_u8.astype(np.float32), (31, 31), 0)
+        soft_max = float(soft_shadow.max())
+        if soft_max > 0:
+            soft_shadow = soft_shadow / soft_max
         
-        # Process individual shadow regions
         num_labels, labels = cv2.connectedComponents(shadow_u8)
         
         for i in range(1, num_labels + 1):
             s_mask = labels == i
+            if int(s_mask.sum()) < 80:
+                continue
             
-            # Find the immediate lit neighborhood around this specific shadow
             s_dilated = cv2.dilate(s_mask.astype(np.uint8), np.ones((15, 15), np.uint8))
             s_neighbors = (s_dilated > 0) & (~shadow_mask)
             
             if not s_neighbors.any():
                 continue
-                
-            # Apply channel-wise gain to correct both brightness and ambient color shift
-            for ch in range(3):
-                val_s = img_f32[:, :, ch][s_mask].mean()
-                val_n = img_f32[:, :, ch][s_neighbors].mean()
-                
-                # Avoid division by zero
-                val_s = max(val_s, 1e-4)
-                
-                # Direct Multiplicative Gain
-                gain = val_n / val_s
-                
-                # Limit the gain to prevent noise amplification in deep shadows
-                gain = np.clip(gain, 1.0, 4.0)
-                
-                compensated[:, :, ch][s_mask] = img_f32[:, :, ch][s_mask] * gain
 
-        # Alpha blend with the sharp soft shadow mask
-        result = img_f32.copy()
-        for ch in range(3):
-            result[:, :, ch] = img_f32[:, :, ch] * (1.0 - soft_shadow) + compensated[:, :, ch] * soft_shadow
+            texture_entropy = self._entropy(lbp_raw[s_mask])
+            texture_strength = np.clip(
+                texture_entropy / max(self.entropy_threshold, 1e-4), 0.0, 1.0
+            )
+            edge_strength = float(np.clip(gradient[s_mask].mean(), 0.0, 1.0))
+            if weberface is not None:
+                edge_strength = max(
+                    edge_strength,
+                    float(np.clip(weberface[s_mask].mean(), 0.0, 1.0)),
+                )
 
-        return np.clip(result, 0.0, 1.0)
+            structure_confidence = np.clip(
+                0.65 * texture_strength + 0.35 * edge_strength, 0.0, 1.0
+            )
+            if structure_confidence > 0.55:
+                continue
+
+            coverage = float(shadow_mask.mean())
+            coverage_scale = 1.0
+            if coverage > self.max_shadow_coverage:
+                coverage_scale = max(0.25, self.max_shadow_coverage / coverage)
+            correction_strength = (
+                0.40 - 0.25 * structure_confidence
+            ) * coverage_scale * self.correction_strength_scale
+
+            val_s = max(float(lab_l[s_mask].mean()), 1e-4)
+            val_n = float(lab_l[s_neighbors].mean())
+            additive_lift = np.clip(val_n - val_s, 0.0, 0.22)
+            safe_pixels = s_mask & (gradient < 0.65)
+            illumination_delta[safe_pixels] = additive_lift * correction_strength
+
+        illumination_delta = cv2.GaussianBlur(illumination_delta, (31, 31), 0)
+        blended_l = lab_l + illumination_delta * soft_shadow
+        lab_f32[:, :, 0] = np.clip(blended_l * 255.0, 0, 255)
+        compensated_bgr = cv2.cvtColor(lab_f32.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+        return compensated_bgr.astype(np.float32) / 255.0
 
     # ------------------------------------------------------------------
     # Bonus – Weberface
@@ -454,6 +604,7 @@ class Module2Processor:
             (rsz(g2b(proc.L_normalized)), "L-CLAHE"),
             (rsz(g2b(proc.gradient)), "Gradient(NMS)"),
             (rsz(g2b(proc.lbp)), "LBP"),
+            (rsz(g2b(proc.structure_map)), "Structure"),
             (rsz(g2b(proc.shadow_mask)), "Shadow"),
             (rsz(proc.final), "Compensated"),
         ]
@@ -557,5 +708,3 @@ if __name__ == "__main__":
     _safe_save(os.path.join(out_dir, "m2v2_B_final.png"), pb.final)
     _safe_save(os.path.join(out_dir, "m2v2_canvas.png"),  canvas)
     print(f"[INFO] Outputs saved -> {out_dir}")
-
-
