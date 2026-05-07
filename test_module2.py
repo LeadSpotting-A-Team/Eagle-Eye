@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from module2 import Module2Processor, ProcessedImage
 
 
+
 PASS = "[PASS]"
 FAIL = "[FAIL]"
 
