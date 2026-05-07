@@ -33,7 +33,7 @@ A 2D processing pipeline to identify minute physical changes while ignoring envi
 ## Usage
 To test the Illumination Invariant Pre-processing (Eagle-Eye Module 2):
 ```bash
-python module2.py "Data/szadaim1.jpg" "Data/szadaim2.jpg"
+python module2.py "Data/photo.jpg" "Data/photo.jpg"
 ```
 
 ## Success Criteria

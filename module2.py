@@ -475,7 +475,7 @@ class Module2Processor:
         
         num_labels, labels = cv2.connectedComponents(shadow_u8)
         
-        for i in range(1, num_labels + 1):
+        for i in range(1, num_labels):
             s_mask = labels == i
             if int(s_mask.sum()) < 80:
                 continue
