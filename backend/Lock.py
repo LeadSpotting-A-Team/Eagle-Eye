@@ -5,7 +5,7 @@ from matplotlib import pyplot as plt
 
  
 
-def The_Lock(reference_image : np.ndarray, new_image : np.ndarray, keypoints_detector = cv.ORB_create()):
+def The_Lock(reference_image : np.ndarray, new_image : np.ndarray, keypoints_detector = cv.ORB_create(nfeatures=5000)):
     '''
     Aligns a new image to a reference image's coordinate system using ORB features and Homography.
 
@@ -18,6 +18,14 @@ def The_Lock(reference_image : np.ndarray, new_image : np.ndarray, keypoints_det
         aligned_image (np.ndarray): The 'new_image' transformed to perfectly overlay the 'reference_image'.
         M (np.ndarray): The 3x3 perspective transformation matrix used for the alignment.
     '''
+
+    if reference_image is None:
+        raise ValueError("Reference image is None")
+    if new_image is None:
+        raise ValueError("New image is None")
+    if keypoints_detector is None:
+        raise ValueError("Keypoints detector is None")
+
     # 1. Feature Extraction: Find keypoints (points of interest) and descriptors (their "ID cards")
     # reference_image: The static image we want to match to.
     # new_image: The image that might have different zoom/angle.
