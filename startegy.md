@@ -1,5 +1,55 @@
 # Strategy: Hybrid AI-Assisted Change Detection Pipeline
 
+## Implementation Update - 2026-05-07
+
+Module 3 was moved closer to the planned dual-path Sensor architecture.
+
+Completed in the current backend pass:
+
+- `backend/change_types.py` is now the shared public type layer for Module 3.
+  It defines `ChangeType`, `ChangeDetection`, and `ChangeDetectionResult`,
+  while keeping backward-compatible aliases such as `bounding_box`,
+  `detections`, `alignment`, and `diagnostics`.
+- `backend/change_detection.py` now uses the shared public types and returns a
+  structured result with `ground_candidates`, `object_candidates`,
+  `final_detections`, `rejected_candidates`, and `debug_info`.
+- Path A remains the classical ground candidate generator. It produces
+  `GROUND_CHANGE` candidates from patch-based texture/structure differences,
+  not final truth decisions.
+- Path B now supports the object-detector adapter flow:
+  detect objects on the reference image, detect objects on the aligned new
+  image, compare them by IoU and class, and emit `OBJECT_ADDED` or
+  `OBJECT_REMOVED`.
+- In strict no-AI mode, Path B can still use the existing deterministic
+  structural fallback so older deterministic tests and workflows continue to
+  work without YOLO.
+- `backend/object_detector.py` contains the adapter interface, `NoOpDetector`,
+  and optional `YoloDetector`. The YOLO import is dynamic and guarded, so the
+  no-AI scanner no longer sees a forbidden static `ultralytics` import.
+- Fusion now suppresses an overlapping ground candidate only when the object
+  candidate is high confidence. Low-confidence object candidates no longer
+  erase ground candidates.
+- `run_dual_path_change_detection(...)` now skips tracker updates on
+  `GEOMETRY_FAILURE`, so bad geometry frames do not increment or break temporal
+  persistence.
+- Tests were expanded for object added, object removed, unchanged matched
+  objects, low-confidence fusion behavior, and geometry-failure tracker
+  handling.
+
+Current verification status:
+
+- `python test_dual_path_change_detection.py`: 18/18 passed.
+- `python test_module2.py`: 6/6 passed.
+
+Still future work:
+
+- Add a real verifier model over candidate crops.
+- Enable YOLO only in an explicit hybrid-AI runtime mode with installed
+  optional dependencies.
+- Add richer persisted debug image export behind config.
+- Add semantic reporting and optional segmentation after candidate
+  verification.
+
 ## מטרת המסמך
 
 המסמך הזה מגדיר את אסטרטגיית ההמשך למערכת Eagle-Eye. המטרה היא לשפר את איכות זיהוי השינויים, להפחית false positives, ולתת למשתמש תוצאה שימושית יותר מאשר מלבנים כלליים של `Ground Change` או `Object`.

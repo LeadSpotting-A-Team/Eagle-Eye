@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from enum import Enum
+from dataclasses import dataclass, replace
 import logging
 from typing import Any
 
@@ -11,44 +10,17 @@ from scipy.stats import entropy as scipy_entropy
 from scipy.stats import norm
 
 from backend.Lock import ALIGNMENT_OK, GEOMETRY_FAILURE, AlignmentResult, register_images
+from backend.change_tracker import ChangeTracker
+from backend.change_types import ChangeDetection, ChangeDetectionResult, ChangeType
+from backend.object_detector import (
+    NoOpDetector,
+    ObjectDetection,
+    ObjectDetector,
+    build_object_detector,
+)
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-class ChangeType(str, Enum):
-    """Supported deterministic change categories emitted by the detector."""
-
-    GROUND = "Ground Change"
-    OBJECT = "Object"
-
-
-@dataclass
-class ChangeDetection:
-    """Single detected changed region in reference-image coordinates."""
-
-    bounding_box: tuple[int, int, int, int]
-    change_type: ChangeType
-    confidence_score: float
-    p_value: float
-    persistence_count: int = 1
-    is_real: bool = False
-    compactness: float | None = None
-    gradient_density: float | None = None
-    compactness_passed: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ChangeDetectionResult:
-    """Full result for one before/after pair, including alignment diagnostics."""
-
-    status: str
-    detections: list[ChangeDetection]
-    alignment: AlignmentResult
-    real_detections: list[ChangeDetection] = field(default_factory=list)
-    aligned_bgr: np.ndarray | None = None
-    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -79,15 +51,21 @@ class ChangeDetectorConfig:
     object_compactness_max: float = 25.0
     object_gradient_density_min: float = 0.06
     object_gradient_density_ratio_min: float = 1.20
+    object_detector_confidence_threshold: float = 0.35
+    object_match_iou_threshold: float = 0.50
+    object_same_class_required: bool = True
+    object_classical_fallback_enabled: bool = True
 
     shadow_elongation_min: float = 2.5
     shadow_alignment_cosine: float = 0.82
     shadow_dark_delta: float = -0.04
 
     fusion_iou_threshold: float = 0.20
+    fusion_object_confidence_min: float = 0.50
     temporal_iou_threshold: float = 0.35
     required_persistence: int = 3
     pvalue_floor_std: float = 1e-3
+    save_debug_images: bool = False
 
 
 def _validate_bgr(image: np.ndarray, name: str) -> None:
@@ -208,6 +186,81 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     return float(inter / union)
 
 
+def _is_object_change(change_type: ChangeType) -> bool:
+    """Return True for semantic object add/remove candidates."""
+
+    return change_type in {ChangeType.OBJECT_ADDED, ChangeType.OBJECT_REMOVED, ChangeType.OBJECT}
+
+
+def _object_classes_match(
+    before: ObjectDetection,
+    after: ObjectDetection,
+    same_class_required: bool,
+) -> bool:
+    """Decide whether two detector outputs can represent the same object."""
+
+    if not same_class_required:
+        return True
+    if before.class_id >= 0 and after.class_id >= 0:
+        return before.class_id == after.class_id
+    return before.class_name == after.class_name
+
+
+def _alignment_confidence(
+    alignment: AlignmentResult,
+    config: ChangeDetectorConfig,
+) -> float:
+    """Convert strict alignment diagnostics into a conservative [0, 1] score."""
+
+    if not alignment.ok:
+        return 0.0
+    max_error = max(float(config.alignment_max_reprojection_error), 1e-6)
+    error_fraction = float(np.clip(alignment.reprojection_error / max_error, 0.0, 1.0))
+    inlier_floor = float(config.alignment_min_inlier_ratio)
+    inlier_score = (alignment.inlier_ratio - inlier_floor) / max(1.0 - inlier_floor, 1e-6)
+    inlier_score = float(np.clip(inlier_score, 0.0, 1.0))
+
+    # Reaching the geometry gate already means the pair is usable. Keep the
+    # score high enough that valid borderline alignments do not zero out strong
+    # visual evidence, while still reflecting alignment quality.
+    return float(np.clip(0.90 + 0.07 * (1.0 - error_fraction) + 0.03 * inlier_score, 0.0, 1.0))
+
+
+def _rect_mask(shape: tuple[int, int], box: tuple[int, int, int, int]) -> np.ndarray:
+    """Create a boolean rectangle mask clipped to image bounds."""
+
+    height, width = shape
+    x, y, w, h = box
+    x0 = max(0, int(x))
+    y0 = max(0, int(y))
+    x1 = min(width, int(x + w))
+    y1 = min(height, int(y + h))
+    mask = np.zeros((height, width), dtype=bool)
+    if x1 > x0 and y1 > y0:
+        mask[y0:y1, x0:x1] = True
+    return mask
+
+
+def _bbox_valid_ratio(valid_mask: np.ndarray, box: tuple[int, int, int, int]) -> float:
+    """Return how much of a bbox is inside the valid warped-overlap mask."""
+
+    mask = _rect_mask(valid_mask.shape, box)
+    if not mask.any():
+        return 0.0
+    return float(valid_mask[mask].mean())
+
+
+def _serialize_object_detection(det: ObjectDetection) -> dict[str, Any]:
+    """Small debug payload for detector outputs."""
+
+    return {
+        "bbox": det.bbox,
+        "class_id": det.class_id,
+        "class_name": det.class_name,
+        "confidence": float(det.confidence),
+    }
+
+
 def _p_value_from_background(
     score: float,
     background_scores: list[float],
@@ -314,90 +367,20 @@ def _is_shadow_like(
     return cosine >= config.shadow_alignment_cosine
 
 
-class ChangeTracker:
-    """Stateful 3-frame consensus tracker in reference-image coordinates."""
-
-    def __init__(
-        self,
-        required_persistence: int = 3,
-        iou_threshold: float = 0.35,
-    ) -> None:
-        """Create a tracker that promotes detections after consecutive IoU matches."""
-
-        self.required_persistence = int(required_persistence)
-        self.iou_threshold = float(iou_threshold)
-        self._tracks: list[dict[str, Any]] = []
-        self._ordinal = 0
-
-    def update(
-        self,
-        detections: list[ChangeDetection],
-        frame_id: Any = None,
-    ) -> list[ChangeDetection]:
-        """Update tracks with one frame of detections and return only real changes."""
-
-        ordinal = self._ordinal
-        self._ordinal += 1
-        matched_tracks: set[int] = set()
-        output: list[ChangeDetection] = []
-
-        for detection in sorted(detections, key=lambda d: (d.bounding_box[1], d.bounding_box[0], d.change_type.value)):
-            best_idx = None
-            best_iou = 0.0
-            for idx, track in enumerate(self._tracks):
-                if idx in matched_tracks or track["change_type"] != detection.change_type:
-                    continue
-                overlap = _iou(track["bounding_box"], detection.bounding_box)
-                if overlap >= self.iou_threshold and overlap > best_iou:
-                    best_idx = idx
-                    best_iou = overlap
-
-            if best_idx is None:
-                count = 1
-                self._tracks.append(
-                    {
-                        "change_type": detection.change_type,
-                        "bounding_box": detection.bounding_box,
-                        "persistence_count": count,
-                        "last_seen": ordinal,
-                    }
-                )
-                best_idx = len(self._tracks) - 1
-            else:
-                track = self._tracks[best_idx]
-                count = (
-                    int(track["persistence_count"]) + 1
-                    if int(track["last_seen"]) == ordinal - 1
-                    else 1
-                )
-                track["bounding_box"] = detection.bounding_box
-                track["persistence_count"] = count
-                track["last_seen"] = ordinal
-
-            matched_tracks.add(best_idx)
-            tracked = replace(
-                detection,
-                persistence_count=count,
-                is_real=count >= self.required_persistence,
-            )
-            tracked.metadata = dict(tracked.metadata)
-            tracked.metadata["frame_id"] = frame_id
-            output.append(tracked)
-
-        max_gap = max(1, self.required_persistence)
-        self._tracks = [
-            track for track in self._tracks if ordinal - int(track["last_seen"]) <= max_gap
-        ]
-        return [detection for detection in output if detection.is_real]
-
-
 class DualPathChangeDetector:
     """Deterministic two-path change detector with strict geometry gating."""
 
-    def __init__(self, config: ChangeDetectorConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ChangeDetectorConfig | None = None,
+        object_detector: ObjectDetector | None = None,
+    ) -> None:
         """Create a detector using explicit thresholds or the default conservative config."""
 
         self.config = config or ChangeDetectorConfig()
+        self.object_detector = object_detector or build_object_detector(
+            confidence_threshold=self.config.object_detector_confidence_threshold,
+        )
 
     def detect(
         self,
@@ -407,7 +390,6 @@ class DualPathChangeDetector:
     ) -> ChangeDetectionResult:
         """Align a pair, run both detection paths, fuse results, and return diagnostics."""
 
-        _ = frame_id
         _validate_bgr(reference_bgr, "reference_bgr")
         _validate_bgr(new_bgr, "new_bgr")
 
@@ -429,29 +411,67 @@ class DualPathChangeDetector:
             LOGGER.warning("Geometry Failure: no detections emitted")
             return ChangeDetectionResult(
                 status=GEOMETRY_FAILURE,
-                detections=[],
-                alignment=alignment,
-                diagnostics={"failure_reason": alignment.failure_reason},
+                alignment_result=alignment,
+                ground_candidates=[],
+                object_candidates=[],
+                final_detections=[],
+                rejected_candidates=[],
+                debug_info={"failure_reason": alignment.failure_reason},
             )
 
         height, width = reference_bgr.shape[:2]
         aligned_bgr = cv2.warpPerspective(new_bgr, alignment.homography, (width, height))
         valid_mask = self._valid_overlap_mask(new_bgr.shape[:2], (height, width), alignment.homography)
-        ground = self._detect_ground(reference_bgr, aligned_bgr, valid_mask)
-        objects = self._detect_objects(reference_bgr, aligned_bgr, valid_mask)
-        fused = self._fuse(ground, objects)
+        alignment_score = _alignment_confidence(alignment, self.config)
+        debug_info: dict[str, Any] = {
+            "alignment_confidence": alignment_score,
+            "valid_overlap_ratio": float(valid_mask.mean()),
+            "save_debug_images": self.config.save_debug_images,
+        }
+        ground = self._detect_ground(
+            reference_bgr,
+            aligned_bgr,
+            valid_mask,
+            alignment_confidence=alignment_score,
+        )
+        objects = self._detect_objects(
+            reference_bgr,
+            aligned_bgr,
+            valid_mask,
+            alignment_confidence=alignment_score,
+            debug_info=debug_info,
+        )
+        fused, rejected, fusion_decisions = self._fuse(ground, objects, return_debug=True)
+        debug_info.update(
+            {
+                "ground_candidate_count": len(ground),
+                "object_candidate_count": len(objects),
+                "final_detection_count": len(fused),
+                "rejected_candidate_count": len(rejected),
+                "fusion_decisions": fusion_decisions,
+                "final_detections": [
+                    {
+                        "bbox": det.bbox,
+                        "change_type": det.change_type.value,
+                        "confidence_score": det.confidence_score,
+                        "source": det.source,
+                        "label": det.label,
+                        "reason": det.reason,
+                    }
+                    for det in fused
+                ],
+            }
+        )
 
         return ChangeDetectionResult(
             status=ALIGNMENT_OK,
-            detections=fused,
-            alignment=alignment,
+            alignment_result=alignment,
+            ground_candidates=ground,
+            object_candidates=objects,
+            final_detections=fused,
+            rejected_candidates=rejected,
             aligned_bgr=aligned_bgr,
-            diagnostics={
-                "ground_candidates": len(ground),
-                "object_candidates": len(objects),
-                "fused_detections": len(fused),
-                "valid_overlap_ratio": float(valid_mask.mean()),
-            },
+            debug_info=debug_info,
         )
 
     @staticmethod
@@ -475,6 +495,7 @@ class DualPathChangeDetector:
         reference_bgr: np.ndarray,
         aligned_bgr: np.ndarray,
         valid_mask: np.ndarray | None = None,
+        alignment_confidence: float = 1.0,
     ) -> list[ChangeDetection]:
         """Path A: find non-structural texture changes on valid overlapping pixels."""
 
@@ -554,19 +575,23 @@ class DualPathChangeDetector:
                 background_scores,
                 self.config.pvalue_floor_std,
             )
-            confidence = float(1.0 - p_value)
+            confidence = float((1.0 - p_value) * (0.95 + 0.05 * alignment_confidence))
             if confidence < self.config.min_confidence_score:
                 continue
             detections.append(
                 ChangeDetection(
-                    bounding_box=(x, y, w, h),
-                    change_type=ChangeType.GROUND,
+                    bbox=(x, y, w, h),
+                    change_type=ChangeType.GROUND_CHANGE,
                     confidence_score=confidence,
+                    source="path_a",
+                    mask=mask,
+                    reason="Patch texture/structure statistics changed after illumination and geometry gates",
                     p_value=p_value,
                     metadata={
                         "score": region_score,
                         "area": area,
                         "path": "A",
+                        "alignment_confidence": alignment_confidence,
                     },
                 )
             )
@@ -577,6 +602,184 @@ class DualPathChangeDetector:
         reference_bgr: np.ndarray,
         aligned_bgr: np.ndarray,
         valid_mask: np.ndarray | None = None,
+        alignment_confidence: float = 1.0,
+        debug_info: dict[str, Any] | None = None,
+    ) -> list[ChangeDetection]:
+        """Path B: compare detected objects before/after in reference coordinates."""
+
+        if valid_mask is None:
+            valid_mask = np.ones(reference_bgr.shape[:2], dtype=bool)
+        if debug_info is None:
+            debug_info = {}
+
+        before_objects = self.object_detector.detect(reference_bgr)
+        after_objects = self.object_detector.detect(aligned_bgr)
+        debug_info["object_detections_before"] = [
+            _serialize_object_detection(det) for det in before_objects
+        ]
+        debug_info["object_detections_after"] = [
+            _serialize_object_detection(det) for det in after_objects
+        ]
+
+        object_changes = self._compare_object_detections(
+            before_objects,
+            after_objects,
+            valid_mask,
+            alignment_confidence,
+            debug_info,
+        )
+        if object_changes or not isinstance(self.object_detector, NoOpDetector):
+            return object_changes
+
+        if not self.config.object_classical_fallback_enabled:
+            return []
+
+        fallback = self._detect_classical_structural_objects(
+            reference_bgr,
+            aligned_bgr,
+            valid_mask,
+            alignment_confidence=alignment_confidence,
+        )
+        debug_info["classical_object_fallback_count"] = len(fallback)
+        return fallback
+
+    def _compare_object_detections(
+        self,
+        before_objects: list[ObjectDetection],
+        after_objects: list[ObjectDetection],
+        valid_mask: np.ndarray,
+        alignment_confidence: float,
+        debug_info: dict[str, Any],
+    ) -> list[ChangeDetection]:
+        """Convert detector before/after differences into object change candidates."""
+
+        filtered_before = self._filter_detector_outputs(before_objects, valid_mask, "before", debug_info)
+        filtered_after = self._filter_detector_outputs(after_objects, valid_mask, "after", debug_info)
+        candidate_pairs: list[tuple[float, int, int]] = []
+        for before_idx, before in enumerate(filtered_before):
+            for after_idx, after in enumerate(filtered_after):
+                if not _object_classes_match(before, after, self.config.object_same_class_required):
+                    continue
+                overlap = _iou(before.bbox, after.bbox)
+                if overlap >= self.config.object_match_iou_threshold:
+                    candidate_pairs.append((overlap, before_idx, after_idx))
+
+        matched_before: set[int] = set()
+        matched_after: set[int] = set()
+        for overlap, before_idx, after_idx in sorted(candidate_pairs, reverse=True):
+            if before_idx in matched_before or after_idx in matched_after:
+                continue
+            matched_before.add(before_idx)
+            matched_after.add(after_idx)
+            debug_info.setdefault("object_match_decisions", []).append(
+                {
+                    "before_bbox": filtered_before[before_idx].bbox,
+                    "after_bbox": filtered_after[after_idx].bbox,
+                    "iou": overlap,
+                    "decision": "same_object_no_change",
+                }
+            )
+
+        detections: list[ChangeDetection] = []
+        for after_idx, after in enumerate(filtered_after):
+            if after_idx not in matched_after:
+                detections.append(
+                    self._object_change_from_detection(
+                        after,
+                        ChangeType.OBJECT_ADDED,
+                        alignment_confidence,
+                        "Object detected only in aligned new image",
+                    )
+                )
+        for before_idx, before in enumerate(filtered_before):
+            if before_idx not in matched_before:
+                detections.append(
+                    self._object_change_from_detection(
+                        before,
+                        ChangeType.OBJECT_REMOVED,
+                        alignment_confidence,
+                        "Object detected only in reference image",
+                    )
+                )
+        return sorted(detections, key=lambda d: (d.bbox[1], d.bbox[0], d.change_type.value))
+
+    def _filter_detector_outputs(
+        self,
+        detections: list[ObjectDetection],
+        valid_mask: np.ndarray,
+        side: str,
+        debug_info: dict[str, Any],
+    ) -> list[ObjectDetection]:
+        """Apply confidence and valid-overlap gates to raw object detections."""
+
+        filtered: list[ObjectDetection] = []
+        for det in detections:
+            if det.confidence < self.config.object_detector_confidence_threshold:
+                debug_info.setdefault("rejected_object_detections", []).append(
+                    {
+                        "side": side,
+                        "bbox": det.bbox,
+                        "reason": "detector confidence below threshold",
+                        "confidence": float(det.confidence),
+                    }
+                )
+                continue
+            valid_ratio = _bbox_valid_ratio(valid_mask, det.bbox)
+            if valid_ratio < 0.98:
+                debug_info.setdefault("rejected_object_detections", []).append(
+                    {
+                        "side": side,
+                        "bbox": det.bbox,
+                        "reason": "bbox outside valid aligned overlap",
+                        "valid_ratio": valid_ratio,
+                    }
+                )
+                continue
+            filtered.append(det)
+        return filtered
+
+    def _object_change_from_detection(
+        self,
+        detection: ObjectDetection,
+        change_type: ChangeType,
+        alignment_confidence: float,
+        reason: str,
+    ) -> ChangeDetection:
+        """Convert an ObjectDetection into a public ChangeDetection."""
+
+        confidence = float(
+            np.clip(
+                detection.confidence * (0.95 + 0.05 * alignment_confidence),
+                0.0,
+                1.0,
+            )
+        )
+        label = detection.class_name if detection.class_name != "unknown" else None
+        return ChangeDetection(
+            bbox=detection.bbox,
+            change_type=change_type,
+            confidence_score=confidence,
+            source="path_b",
+            label=label,
+            mask=None,
+            reason=reason,
+            p_value=1.0 - confidence,
+            compactness_passed=True,
+            metadata={
+                "class_id": detection.class_id,
+                "class_name": detection.class_name,
+                "detector_confidence": float(detection.confidence),
+                "alignment_confidence": alignment_confidence,
+                "path": "B",
+            },
+        )
+
+    def _detect_classical_structural_objects(
+        self,
+        reference_bgr: np.ndarray,
+        aligned_bgr: np.ndarray,
+        valid_mask: np.ndarray | None = None,
+        alignment_confidence: float = 1.0,
     ) -> list[ChangeDetection]:
         """Path B: find compact structural objects using edge and gradient heuristics."""
 
@@ -647,14 +850,17 @@ class DualPathChangeDetector:
                 background_scores,
                 self.config.pvalue_floor_std,
             )
-            confidence = float(1.0 - p_value)
+            confidence = float((1.0 - p_value) * (0.95 + 0.05 * alignment_confidence))
             if confidence < self.config.min_confidence_score:
                 continue
             detections.append(
                 ChangeDetection(
-                    bounding_box=(int(x), int(y), int(w), int(h)),
-                    change_type=ChangeType.OBJECT,
+                    bbox=(int(x), int(y), int(w), int(h)),
+                    change_type=ChangeType.OBJECT_ADDED,
                     confidence_score=confidence,
+                    source="path_b_classical",
+                    mask=mask,
+                    reason="Classical structural fallback found new compact edge/gradient region",
                     p_value=p_value,
                     compactness=compactness,
                     gradient_density=internal_density,
@@ -663,6 +869,7 @@ class DualPathChangeDetector:
                         "area": area,
                         "density_ratio": density_ratio,
                         "path": "B",
+                        "alignment_confidence": alignment_confidence,
                     },
                 )
             )
@@ -672,29 +879,59 @@ class DualPathChangeDetector:
         self,
         ground: list[ChangeDetection],
         objects: list[ChangeDetection],
-    ) -> list[ChangeDetection]:
+        return_debug: bool = False,
+    ) -> list[ChangeDetection] | tuple[list[ChangeDetection], list[ChangeDetection], list[dict[str, Any]]]:
         """Resolve overlapping Path A/Path B detections with object priority."""
 
         kept_ground: list[ChangeDetection] = []
+        rejected: list[ChangeDetection] = []
+        decisions: list[dict[str, Any]] = []
         for ground_detection in ground:
-            suppressed = any(
-                obj.compactness_passed
-                and _iou(ground_detection.bounding_box, obj.bounding_box)
-                >= self.config.fusion_iou_threshold
-                for obj in objects
-            )
-            if not suppressed:
+            suppressing_object: ChangeDetection | None = None
+            suppressing_iou = 0.0
+            for obj in objects:
+                overlap = _iou(ground_detection.bbox, obj.bbox)
+                high_confidence_object = obj.confidence_score >= self.config.fusion_object_confidence_min
+                if (
+                    _is_object_change(obj.change_type)
+                    and high_confidence_object
+                    and overlap >= self.config.fusion_iou_threshold
+                    and overlap > suppressing_iou
+                ):
+                    suppressing_object = obj
+                    suppressing_iou = overlap
+
+            if suppressing_object is None:
                 kept_ground.append(ground_detection)
+                continue
+
+            rejected_candidate = replace(
+                ground_detection,
+                source="fusion",
+                reason="Suppressed by overlapping high-confidence object candidate",
+            )
+            rejected.append(rejected_candidate)
+            decisions.append(
+                {
+                    "ground_bbox": ground_detection.bbox,
+                    "object_bbox": suppressing_object.bbox,
+                    "iou": suppressing_iou,
+                    "decision": "prefer_object",
+                }
+            )
 
         fused = [*objects, *kept_ground]
-        return sorted(
+        sorted_fused = sorted(
             fused,
             key=lambda d: (
-                d.bounding_box[1],
-                d.bounding_box[0],
-                0 if d.change_type == ChangeType.OBJECT else 1,
+                d.bbox[1],
+                d.bbox[0],
+                0 if _is_object_change(d.change_type) else 1,
             ),
         )
+        if return_debug:
+            return sorted_fused, rejected, decisions
+        return sorted_fused
 
 
 def run_dual_path_change_detection(
@@ -703,11 +940,12 @@ def run_dual_path_change_detection(
     tracker: ChangeTracker | None = None,
     config: ChangeDetectorConfig | None = None,
     frame_id: Any = None,
+    object_detector: ObjectDetector | None = None,
 ) -> ChangeDetectionResult:
     """Convenience API for one detection call, optionally applying temporal tracking."""
 
-    detector = DualPathChangeDetector(config)
+    detector = DualPathChangeDetector(config, object_detector=object_detector)
     result = detector.detect(reference_bgr, new_bgr, frame_id=frame_id)
-    if tracker is not None:
+    if tracker is not None and result.status != GEOMETRY_FAILURE:
         result.real_detections = tracker.update(result.detections, frame_id=frame_id)
     return result

@@ -11,6 +11,7 @@ from backend.change_detection import (
     ChangeTracker,
     DualPathChangeDetector,
 )
+from backend.object_detector import ObjectDetector
 
 
 def run_module1_module2(
@@ -79,9 +80,10 @@ def run_dual_path_change_detection(
     tracker: ChangeTracker | None = None,
     config: ChangeDetectorConfig | None = None,
     frame_id=None,
+    object_detector: ObjectDetector | None = None,
 ) -> ChangeDetectionResult:
-    detector = DualPathChangeDetector(config)
+    detector = DualPathChangeDetector(config, object_detector=object_detector)
     result = detector.detect(reference_bgr, new_bgr, frame_id=frame_id)
-    if tracker is not None:
+    if tracker is not None and result.status != "GEOMETRY_FAILURE":
         result.real_detections = tracker.update(result.detections, frame_id=frame_id)
     return result

@@ -21,8 +21,10 @@ from backend.change_detection import (
     ChangeTracker,
     ChangeType,
     DualPathChangeDetector,
+    run_dual_path_change_detection,
 )
 from backend.no_ai_guard import assert_no_ai_policy
+from backend.object_detector import ObjectDetection, ObjectDetector
 
 
 PASS = "[PASS]"
@@ -71,6 +73,17 @@ def _make_warped_pair():
 
 def _detector(config=None):
     return DualPathChangeDetector(config or ChangeDetectorConfig())
+
+
+class FakeObjectDetector(ObjectDetector):
+    def __init__(self, before, after):
+        self.before = before
+        self.after = after
+        self.calls = 0
+
+    def detect(self, image_bgr):
+        self.calls += 1
+        return self.before if self.calls == 1 else self.after
 
 
 def test_alignment_known_homography_passes():
@@ -201,6 +214,64 @@ def test_fusion_prioritizes_compact_object():
     assert fused[0].change_type == ChangeType.OBJECT, "Object path has priority"
 
 
+def test_fusion_keeps_ground_for_low_confidence_object():
+    detector = _detector()
+    ground = [
+        ChangeDetection((10, 10, 50, 50), ChangeType.GROUND, 0.8, 0.2),
+    ]
+    objects = [
+        ChangeDetection(
+            (12, 12, 45, 45),
+            ChangeType.OBJECT_ADDED,
+            0.2,
+            0.8,
+            compactness_passed=True,
+        ),
+    ]
+    fused = detector._fuse(ground, objects)
+    assert len(fused) == 2, "Low-confidence object should not suppress ground"
+    assert any(d.change_type == ChangeType.GROUND for d in fused), "Expected ground candidate to remain"
+
+
+def test_object_adapter_added_detected():
+    ref = _make_reference()
+    changed = ref.copy()
+    fake = FakeObjectDetector(
+        before=[],
+        after=[ObjectDetection((140, 145, 44, 48), class_id=1, class_name="box", confidence=0.91)],
+    )
+    result = DualPathChangeDetector(object_detector=fake).detect(ref, changed)
+    assert result.status == ALIGNMENT_OK, result.alignment.failure_reason
+    assert len(result.object_candidates) == 1, "Expected one object change candidate"
+    assert result.object_candidates[0].change_type == ChangeType.OBJECT_ADDED
+    assert result.object_candidates[0].label == "box"
+
+
+def test_object_adapter_removed_detected():
+    ref = _make_reference()
+    changed = ref.copy()
+    fake = FakeObjectDetector(
+        before=[ObjectDetection((140, 145, 44, 48), class_id=1, class_name="box", confidence=0.91)],
+        after=[],
+    )
+    result = DualPathChangeDetector(object_detector=fake).detect(ref, changed)
+    assert result.status == ALIGNMENT_OK, result.alignment.failure_reason
+    assert len(result.object_candidates) == 1, "Expected one object change candidate"
+    assert result.object_candidates[0].change_type == ChangeType.OBJECT_REMOVED
+
+
+def test_object_adapter_same_object_is_not_change():
+    ref = _make_reference()
+    changed = ref.copy()
+    fake = FakeObjectDetector(
+        before=[ObjectDetection((140, 145, 44, 48), class_id=1, class_name="box", confidence=0.91)],
+        after=[ObjectDetection((142, 146, 44, 48), class_id=1, class_name="box", confidence=0.89)],
+    )
+    result = DualPathChangeDetector(object_detector=fake).detect(ref, changed)
+    assert result.status == ALIGNMENT_OK, result.alignment.failure_reason
+    assert result.object_candidates == [], "Matched before/after object should not be a change"
+
+
 def test_temporal_three_frame_consensus():
     tracker = ChangeTracker(required_persistence=3, iou_threshold=0.35)
     det = ChangeDetection((20, 20, 40, 40), ChangeType.GROUND, 0.9, 0.1)
@@ -212,6 +283,23 @@ def test_temporal_three_frame_consensus():
     tracker.update([], frame_id=4)
     real_after_gap = tracker.update([det], frame_id=5)
     assert real_after_gap == [], "A missed frame must break consecutiveness"
+
+
+def test_geometry_failure_does_not_advance_tracker():
+    tracker = ChangeTracker(required_persistence=3, iou_threshold=0.35)
+    det = ChangeDetection((20, 20, 40, 40), ChangeType.GROUND, 0.9, 0.1)
+    assert tracker.update([det], frame_id=1) == []
+    assert tracker.update([det], frame_id=2) == []
+
+    ref, new = _make_warped_pair()
+    config = ChangeDetectorConfig(alignment_max_reprojection_error=0.01)
+    result = run_dual_path_change_detection(ref, new, tracker=tracker, config=config, frame_id="bad")
+    assert result.status == GEOMETRY_FAILURE, "Expected geometry failure"
+    assert result.real_detections == [], "Geometry failure must not create confirmed detections"
+
+    real = tracker.update([det], frame_id=3)
+    assert len(real) == 1, "Geometry failure frame should be ignored by tracker"
+    assert real[0].persistence_count == 3
 
 
 def test_no_ai_policy_guard():
@@ -234,8 +322,13 @@ run_test("T8 - thin elongated object rejected", test_thin_elongated_region_fails
 run_test("T9 - flat blob rejected", test_flat_blob_fails_gradient_density)
 run_test("T10 - shadow-like region suppressed", test_shadow_like_region_suppressed)
 run_test("T11 - fusion object priority", test_fusion_prioritizes_compact_object)
-run_test("T12 - temporal consensus", test_temporal_three_frame_consensus)
-run_test("T13 - no-AI policy guard", test_no_ai_policy_guard)
+run_test("T12 - low-confidence object does not erase ground", test_fusion_keeps_ground_for_low_confidence_object)
+run_test("T13 - object adapter added", test_object_adapter_added_detected)
+run_test("T14 - object adapter removed", test_object_adapter_removed_detected)
+run_test("T15 - matched object is unchanged", test_object_adapter_same_object_is_not_change)
+run_test("T16 - temporal consensus", test_temporal_three_frame_consensus)
+run_test("T17 - geometry failure ignored by tracker", test_geometry_failure_does_not_advance_tracker)
+run_test("T18 - no-AI policy guard", test_no_ai_policy_guard)
 
 print()
 print("=" * 60)

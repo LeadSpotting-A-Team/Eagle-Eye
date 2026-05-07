@@ -1,42 +1,158 @@
-# Architectural Fingerprinting & Eagle-Eye Change Detection
+# Eagle-Eye Change Detection
 
-A dual-module computer vision suite for unique building identification and multi-temporal change analysis.
+Eagle-Eye is a computer-vision backend for comparing a reference image with a
+new image and reporting candidate physical changes in reference-image
+coordinates.
 
-## 1. Architectural Fingerprinting
-Generates a structured, unique "ID" for buildings based on permanent physical characteristics, designed to be perspective and lighting invariant.
-- **Structural Analysis:** Floor counting and window grid mapping (e.g., Floor 1: 8 windows).
-- **Geometric Signature:** Width-to-height structural aspect ratio ($R = w/h$).
-- **Keypoint Descriptors:** Signatures derived from permanent rooflines and structural corners.
-- **Fuzzy Matching:** Robust logic to handle partial occlusions (trees, shadows) and varying angles.
+The current backend focuses on Module 3: Dual-Path Change Detection, also
+called "The Sensor".
 
-## 2. Eagle-Eye (Image Difference)
-A 2D processing pipeline to identify minute physical changes while ignoring environmental noise.
-- **Module 1 (Registration):** Image alignment using SIFT/ORB features and Homography mapping.
-- **Module 2 (Filtering):** Illumination invariant pre-processing using LBP (Local Binary Patterns) and Gradient Analysis to neutralize shadows.
-- **Module 3 (Detection):** Deterministic dual-path detection for ground textures (holes/stains/debris) and discrete physical objects using classical image processing.
-- **Module 4 (Reporting):** Visual output with color-coded markers:
-    - 🟢 **Added** | 🔴 **Removed** | 🟡 **Moved** | 🔵 **Ground Change**.
+## Current Pipeline
 
-## Tech Stack (Planned)
-- **Language:** Python
-- **Core Libraries:** OpenCV (Hough Transforms, Feature Matching)
-- **Image Processing:** Scikit-Image, SciPy, NumPy
-- **No-AI Policy:** No torch, keras, transformers, or ultralytics. Detection is based on OpenCV, NumPy, SciPy, and Euclidean geometry.
-
-## Installation & Setup
-1. Ensure Python 3.9+ is installed.
-2. Install the project dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Usage
-To test the deterministic Module 1 -> Module 2 pipeline:
-```bash
-python run_pipeline_demo.py
+```text
+reference / before image
+new / after image
+    |
+    v
+Module 1: ORB + RANSAC homography alignment
+    |
+    v
+Fail-closed geometry gate
+    |
+    v
+Module 3: Dual-path candidate generation
+    |-- Path A: ground / texture changes
+    |-- Path B: object added / object removed
+    |
+    v
+Deterministic fusion
+    |
+    v
+Optional temporal tracker
 ```
 
-## Success Criteria
-- Stability across different times of day (10:00 AM vs 4:00 PM).
-- High sensitivity to small-scale objects (50cm x 50cm).
-- Minimal false positives from moving shadows or weather.
+If geometry is unreliable, the system returns `GEOMETRY_FAILURE` and emits no
+detections. This is intentional: a bad homography can create false changes.
+
+## Main Files
+
+- `backend/Lock.py`: Module 1 registration and geometry validation.
+- `backend/Filter.py`: Module 2 illumination and structure preprocessing.
+- `backend/change_types.py`: public Module 3 result types.
+- `backend/change_detection.py`: dual-path detector, fusion, and main API.
+- `backend/object_detector.py`: optional object-detector adapter, including
+  `NoOpDetector` and guarded `YoloDetector`.
+- `backend/change_tracker.py`: temporal persistence tracker.
+- `backend/dependency_policy.py`: classical-only vs hybrid-AI dependency mode.
+- `backend/no_ai_guard.py`: static no-AI policy scanner.
+- `run_pipeline_demo.py`: CLI demo for before/after pairs.
+
+## Public API
+
+Use:
+
+```python
+from backend.change_detection import run_dual_path_change_detection
+
+result = run_dual_path_change_detection(reference_bgr, new_bgr)
+```
+
+The returned `ChangeDetectionResult` includes:
+
+- `status`
+- `alignment_result`
+- `ground_candidates`
+- `object_candidates`
+- `final_detections`
+- `rejected_candidates`
+- `debug_info`
+
+Backward-compatible aliases are still available:
+
+- `result.detections` -> `result.final_detections`
+- `result.alignment` -> `result.alignment_result`
+- `result.diagnostics` -> `result.debug_info`
+
+## Change Types
+
+The current public categories are:
+
+- `GROUND_CHANGE`
+- `OBJECT_ADDED`
+- `OBJECT_REMOVED`
+- `UNKNOWN_CHANGE`
+
+Legacy aliases `GROUND` and `OBJECT` are kept for older tests and callers.
+
+## Running Tests
+
+From the project root:
+
+```powershell
+python test_dual_path_change_detection.py
+python test_module2.py
+```
+
+Current expected status:
+
+```text
+test_dual_path_change_detection.py: 18/18 passed
+test_module2.py: 6/6 passed
+```
+
+## Running The Demo
+
+The demo needs input images. Running it with no arguments expects
+`sandbox\1.jpeg` and `sandbox\2.jpeg`, which may not exist.
+
+Use one of the bundled dataset pairs:
+
+```powershell
+python run_pipeline_demo.py --dataset-id 1
+```
+
+Save to a specific output path:
+
+```powershell
+python run_pipeline_demo.py --dataset-id 1 --output Output\module3_result.png
+```
+
+Run on explicit files:
+
+```powershell
+python run_pipeline_demo.py --reference "path\to\before.jpg" --new "path\to\after.jpg" --output Output\my_result.png
+```
+
+For visual debugging only, loosen geometry gates:
+
+```powershell
+python run_pipeline_demo.py --dataset-id 1 --relaxed-geometry
+```
+
+`--relaxed-geometry` can create false positives and should not be used for
+reliable reporting.
+
+## Dependency Policy
+
+Default mode is classical-only. The core path must not import forbidden AI
+packages statically:
+
+```text
+torch
+keras
+transformers
+ultralytics
+```
+
+YOLO support is isolated behind `backend/object_detector.py` and a runtime
+adapter. In normal no-AI mode, the system uses `NoOpDetector` plus the
+deterministic structural fallback.
+
+## Current Limitations
+
+- YOLO is not enabled by default.
+- The AI verifier over candidate crops has not been implemented yet.
+- Module 2 maps exist, but Module 3 still mainly works from aligned BGR images.
+- Real precision/recall has not been calibrated on a labeled dataset.
+- The demo processes one before/after pair; temporal tracking is available via
+  API but not shown as a full video sequence demo.
