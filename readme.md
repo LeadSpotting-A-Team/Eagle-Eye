@@ -20,7 +20,21 @@ A 2D processing pipeline to identify minute physical changes while ignoring envi
 ## Tech Stack (Planned)
 - **Language:** Python
 - **Core Libraries:** OpenCV (Hough Transforms, Feature Matching)
-- **DL Framework:** YOLOv8 (Object Detection)
+- **Image Processing:** Scikit-Image, SciPy, NumPy
+- **DL Framework:** YOLOv8 (Object Detection via Ultralytics)
+
+## Installation & Setup
+1. Ensure Python 3.9+ is installed.
+2. Install the project dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Usage
+To test the Illumination Invariant Pre-processing (Eagle-Eye Module 2):
+```bash
+python module2.py "Data/photo.jpg" "Data/photo.jpg"
+```
 
 ## Success Criteria
 - Stability across different times of day (10:00 AM vs 4:00 PM).
