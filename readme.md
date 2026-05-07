@@ -13,7 +13,7 @@ Generates a structured, unique "ID" for buildings based on permanent physical ch
 A 2D processing pipeline to identify minute physical changes while ignoring environmental noise.
 - **Module 1 (Registration):** Image alignment using SIFT/ORB features and Homography mapping.
 - **Module 2 (Filtering):** Illumination invariant pre-processing using LBP (Local Binary Patterns) and Gradient Analysis to neutralize shadows.
-- **Module 3 (Detection):** Dual-path detection for ground textures (holes/stains) and discrete objects (YOLOv8-Small).
+- **Module 3 (Detection):** Deterministic dual-path detection for ground textures (holes/stains/debris) and discrete physical objects using classical image processing.
 - **Module 4 (Reporting):** Visual output with color-coded markers:
     - 🟢 **Added** | 🔴 **Removed** | 🟡 **Moved** | 🔵 **Ground Change**.
 
@@ -21,7 +21,7 @@ A 2D processing pipeline to identify minute physical changes while ignoring envi
 - **Language:** Python
 - **Core Libraries:** OpenCV (Hough Transforms, Feature Matching)
 - **Image Processing:** Scikit-Image, SciPy, NumPy
-- **DL Framework:** YOLOv8 (Object Detection via Ultralytics)
+- **No-AI Policy:** No torch, keras, transformers, or ultralytics. Detection is based on OpenCV, NumPy, SciPy, and Euclidean geometry.
 
 ## Installation & Setup
 1. Ensure Python 3.9+ is installed.
@@ -31,9 +31,9 @@ A 2D processing pipeline to identify minute physical changes while ignoring envi
    ```
 
 ## Usage
-To test the Illumination Invariant Pre-processing (Eagle-Eye Module 2):
+To test the deterministic Module 1 -> Module 2 pipeline:
 ```bash
-python module2.py "Data/photo.jpg" "Data/photo.jpg"
+python run_pipeline_demo.py
 ```
 
 ## Success Criteria

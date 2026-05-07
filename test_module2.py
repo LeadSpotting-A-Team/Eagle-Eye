@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Headless tests for the current Module 2 implementation in module2.py.
+Headless tests for the current Module 2 implementation.
 """
 
 import os
@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from module2 import Module2Processor, ProcessedImage
+from backend.Filter import Module2Processor, ProcessedImage
 
 
 PASS = "[PASS]"
