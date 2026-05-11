@@ -381,6 +381,7 @@ class DualPathChangeDetector:
         self.object_detector = object_detector or build_object_detector(
             confidence_threshold=self.config.object_detector_confidence_threshold,
         )
+        self.module2_processor = None
 
     def detect(
         self,
@@ -428,11 +429,22 @@ class DualPathChangeDetector:
             "valid_overlap_ratio": float(valid_mask.mean()),
             "save_debug_images": self.config.save_debug_images,
         }
+        
+        module2_payload = None
+        if self.module2_processor is not None:
+            try:
+                module2_payload = self.module2_processor.process_pair_for_module3(reference_bgr, aligned_bgr)
+                debug_info["module2_used"] = True
+            except Exception as e:
+                LOGGER.warning(f"Module 2 failed: {e}")
+                debug_info["module2_error"] = str(e)
+
         ground = self._detect_ground(
             reference_bgr,
             aligned_bgr,
             valid_mask,
             alignment_confidence=alignment_score,
+            module2_payload=module2_payload,
         )
         objects = self._detect_objects(
             reference_bgr,
@@ -496,6 +508,7 @@ class DualPathChangeDetector:
         aligned_bgr: np.ndarray,
         valid_mask: np.ndarray | None = None,
         alignment_confidence: float = 1.0,
+        module2_payload: dict | None = None,
     ) -> list[ChangeDetection]:
         """Path A: find non-structural texture changes on valid overlapping pixels."""
 
@@ -520,6 +533,7 @@ class DualPathChangeDetector:
                     continue
                 ref_patch = ref[y:y2, x:x2]
                 new_patch = new[y:y2, x:x2]
+
                 entropy_delta = _entropy_patch(new_patch) - _entropy_patch(ref_patch)
                 ssim = _ssim_patch(ref_patch, new_patch)
                 zncc = _zncc(ref_patch, new_patch)
@@ -536,6 +550,7 @@ class DualPathChangeDetector:
                         or entropy_delta >= self.config.ground_high_entropy_override
                     )
                 )
+                
                 if candidate:
                     candidate_mask[y:y2, x:x2] = 255
                 else:

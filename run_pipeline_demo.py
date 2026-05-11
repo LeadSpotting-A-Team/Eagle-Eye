@@ -176,7 +176,10 @@ def main() -> None:
             alignment_min_inlier_ratio=0.05,
         )
 
-    result = run_dual_path_change_detection(reference_bgr, new_bgr, config=config)
+    from backend.Filter import Module2Processor
+    module2_processor = Module2Processor()
+
+    result = run_dual_path_change_detection(reference_bgr, new_bgr, config=config, module2_processor=module2_processor)
     if result.status == GEOMETRY_FAILURE:
         output = _failure_canvas(reference_bgr, new_bgr, result.alignment.failure_reason or "unknown")
         _safe_write(output_path, output)

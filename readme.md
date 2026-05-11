@@ -20,6 +20,9 @@ Module 1: ORB + RANSAC homography alignment
 Fail-closed geometry gate
     |
     v
+Module 2: Illumination correction and adaptive structure mapping
+    |
+    v
 Module 3: Dual-path candidate generation
     |-- Path A: ground / texture changes
     |-- Path B: object added / object removed
@@ -114,13 +117,13 @@ python run_pipeline_demo.py --dataset-id 1
 Save to a specific output path:
 
 ```powershell
-python run_pipeline_demo.py --dataset-id 1 --output Output\module3_result.png
+python run_pipeline_demo.py --dataset-id 1 --output sandbox\module3_result.png
 ```
 
 Run on explicit files:
 
 ```powershell
-python run_pipeline_demo.py --reference "path\to\before.jpg" --new "path\to\after.jpg" --output Output\my_result.png
+python run_pipeline_demo.py --reference "path\to\before.jpg" --new "path\to\after.jpg" --output sandbox\my_result.png
 ```
 
 For visual debugging only, loosen geometry gates:
@@ -151,8 +154,8 @@ deterministic structural fallback.
 ## Current Limitations
 
 - YOLO is not enabled by default.
-- The AI verifier over candidate crops has not been implemented yet.
-- Module 2 maps exist, but Module 3 still mainly works from aligned BGR images.
+- The AI verifier over candidate crops has not been implemented yet (Module 3.5).
+- Module 2 payload is fully integrated, extracting invariant structure maps alongside the candidates.
 - Real precision/recall has not been calibrated on a labeled dataset.
 - The demo processes one before/after pair; temporal tracking is available via
   API but not shown as a full video sequence demo.

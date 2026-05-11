@@ -81,8 +81,10 @@ def run_dual_path_change_detection(
     config: ChangeDetectorConfig | None = None,
     frame_id=None,
     object_detector: ObjectDetector | None = None,
+    module2_processor: Module2Processor | None = None,
 ) -> ChangeDetectionResult:
     detector = DualPathChangeDetector(config, object_detector=object_detector)
+    detector.module2_processor = module2_processor
     result = detector.detect(reference_bgr, new_bgr, frame_id=frame_id)
     if tracker is not None and result.status != "GEOMETRY_FAILURE":
         result.real_detections = tracker.update(result.detections, frame_id=frame_id)

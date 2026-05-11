@@ -19,6 +19,8 @@ import cv2
 import numpy as np
 from scipy.stats import entropy as scipy_entropy
 from skimage.feature import local_binary_pattern
+from skimage.filters.rank import entropy as rank_entropy
+from skimage.morphology import disk
 from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -234,6 +236,18 @@ class Module2Processor:
     # ------------------------------------------------------------------
 
     def _run(self, img_bgr: np.ndarray) -> ProcessedImage:
+        # --- Specular Highlight Suppression ---
+        # Detect hotspots: near max intensity in L channel and low saturation
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        S_channel = hsv[:, :, 1].astype(np.float32) / 255.0
+        L_raw_initial = self._extract_L(img_bgr)
+        
+        hotspots = (L_raw_initial > 0.95) & (S_channel < 0.15)
+        hotspots_u8 = (hotspots.astype(np.uint8) * 255)
+        
+        if hotspots_u8.any():
+            img_bgr = cv2.inpaint(img_bgr, hotspots_u8, 3, cv2.INPAINT_TELEA)
+
         img_f32 = img_bgr.astype(np.float32) / 255.0
 
         # 1 – Luminance extraction
@@ -250,19 +264,25 @@ class Module2Processor:
         nms = self._nms(grad_mag, grad_dir)
         gradient = _norm01(nms)
 
-        # 5 – LBP (skimage)
-        lbp_raw, lbp_vis = self._lbp(L_blur)
-        structure_map = self._structure_map(gradient, lbp_vis)
-
-        # 8 – Weberface (computed early to aid shadow detection/compensation)
+        # 8 – Weberface (computed early to aid shadow detection and Weber-LBP)
         weberface = self._weberface(L_blur) if self.enable_weberface else None
 
-        # 6 – Adaptive shadow mask (now uses morphological closing & weberface)
-        shadow_mask = self._adaptive_shadow_mask(L_raw, nms, lbp_vis, weberface)
+        # 6 – Adaptive shadow mask (moved before LBP)
+        shadow_mask = self._adaptive_shadow_mask(L_raw, nms, weberface)
+
+        # 5 – LBP (skimage) with Weber-LBP Normalization
+        lbp_raw, lbp_vis = self._lbp(L_blur, shadow_mask, weberface)
+        
+        # Adaptive Weighting (Entropy-based) for structure_map
+        structure_map = self._structure_map(gradient, lbp_vis, L_blur)
+
+        # Shadow Boundary Smoothing (Anti-Ghosting)
+        shadow_mask_u8 = (shadow_mask.astype(np.uint8) * 255)
+        smoothed_shadow = cv2.GaussianBlur(shadow_mask_u8, (7, 7), 0).astype(np.float32) / 255.0
 
         # 7 – Texture- and edge-aware compensation in LAB luminance space
         compensated = self._compensate(
-            img_f32, L_raw, lbp_raw, gradient, shadow_mask, weberface
+            img_f32, L_raw, lbp_raw, gradient, shadow_mask, smoothed_shadow, weberface
         )
         final_bgr = np.clip(compensated * 255.0, 0, 255).astype(np.uint8)
 
@@ -275,7 +295,7 @@ class Module2Processor:
             lbp_raw=lbp_raw,
             lbp=lbp_vis,
             structure_map=structure_map,
-            shadow_mask=(shadow_mask.astype(np.uint8) * 255),
+            shadow_mask=shadow_mask_u8,
             final=final_bgr,
             weberface=weberface,
         )
@@ -348,16 +368,29 @@ class Module2Processor:
     # Step 5 – LBP (skimage)
     # ------------------------------------------------------------------
 
-    def _lbp(self, L: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _lbp(self, L: np.ndarray, shadow_mask: np.ndarray, weberface: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+        L_for_lbp = L.copy()
+        if shadow_mask.any():
+            if weberface is not None:
+                # Integrate Weber contrast
+                L_for_lbp[shadow_mask] = np.clip(L_for_lbp[shadow_mask] + 0.5 * weberface[shadow_mask], 0, 1)
+            else:
+                L_for_lbp[shadow_mask] = np.clip(L_for_lbp[shadow_mask] * 1.5, 0, 1)
+
         raw = local_binary_pattern(
-            _f2u(L), P=self.lbp_n_points,
+            _f2u(L_for_lbp), P=self.lbp_n_points,
             R=self.lbp_radius, method=self.lbp_method,
         ).astype(np.float32)
         return raw, _norm01(raw)
 
     @staticmethod
-    def _structure_map(gradient: np.ndarray, lbp_vis: np.ndarray) -> np.ndarray:
-        return _norm01(0.55 * gradient + 0.45 * lbp_vis)
+    def _structure_map(gradient: np.ndarray, lbp_vis: np.ndarray, L: np.ndarray) -> np.ndarray:
+        L_u8 = _f2u(L)
+        ent = rank_entropy(L_u8, disk(3)).astype(np.float32)
+        w_lbp = _norm01(ent)
+        w_grad = 1.0 - w_lbp
+        
+        return _norm01(w_grad * gradient + w_lbp * lbp_vis)
 
     # ------------------------------------------------------------------
     # Step 6 – Adaptive shadow mask
@@ -367,7 +400,6 @@ class Module2Processor:
         self,
         L: np.ndarray,
         nms: np.ndarray,
-        lbp: np.ndarray,
         weberface: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
@@ -382,7 +414,10 @@ class Module2Processor:
         low_lum = L < min(self.shadow_threshold_ratio * avg_L, dark_ref)
 
         grad_norm = _norm01(nms)
-        structure_map = 0.6 * grad_norm + 0.4 * lbp
+        if weberface is not None:
+            structure_map = 0.6 * grad_norm + 0.4 * weberface
+        else:
+            structure_map = grad_norm
         shadow_seed = low_lum & (grad_norm < 0.12) & (structure_map < 0.20)
         base_shadow = shadow_seed.astype(np.uint8) * 255
 
@@ -447,6 +482,7 @@ class Module2Processor:
         lbp_raw: np.ndarray,
         gradient: np.ndarray,
         shadow_mask: np.ndarray,
+        smoothed_shadow: np.ndarray,
         weberface: Optional[np.ndarray],
     ) -> np.ndarray:
         """
@@ -468,7 +504,7 @@ class Module2Processor:
         lab_l = lab_f32[:, :, 0] / 255.0
         illumination_delta = np.zeros_like(lab_l, dtype=np.float32)
             
-        soft_shadow = cv2.GaussianBlur(shadow_u8.astype(np.float32), (31, 31), 0)
+        soft_shadow = smoothed_shadow
         soft_max = float(soft_shadow.max())
         if soft_max > 0:
             soft_shadow = soft_shadow / soft_max

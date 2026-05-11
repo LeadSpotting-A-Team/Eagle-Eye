@@ -118,18 +118,20 @@ def test_shadow_compensation_effect():
     out = PROC.process_single(IMG_A)
     mask = np.zeros((H, W), dtype=bool)
     mask[30:90, 60:180] = True
+    mask_u8 = mask.astype(np.uint8) * 255
+    smoothed_shadow = cv2.GaussianBlur(mask_u8, (7, 7), 0).astype(np.float32) / 255.0
     compensated = PROC._compensate(
         img,
         out.L_raw,
         out.lbp_raw,
         out.gradient,
         mask,
+        smoothed_shadow,
         out.weberface,
     )
     orig_mean = img[mask].mean()
     comp_mean = compensated[mask].mean()
     assert comp_mean >= orig_mean, "Compensation should not darken the masked region"
-
 
 print()
 print("=" * 60)

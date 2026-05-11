@@ -41,6 +41,12 @@ Current verification status:
 - `python test_dual_path_change_detection.py`: 18/18 passed.
 - `python test_module2.py`: 6/6 passed.
 
+## Implementation Update - Module 2 (Filter.py) Refactor
+
+- Module 2 was refactored to use adaptive entropy-based structure weighting, replacing static weighting.
+- Highlight suppression (via inpainting) and Weber contrast for LBP in shadows were added to combat difficult illumination.
+- The pipeline now correctly integrates `Module2Processor` directly, extracting invariant structural maps alongside the classical candidate bounding boxes.
+
 Still future work:
 
 - Add a real verifier model over candidate crops.
