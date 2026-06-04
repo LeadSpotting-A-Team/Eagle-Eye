@@ -431,24 +431,38 @@ class DualPathChangeDetector:
         }
         
         module2_payload = None
+        # Module 3 must operate on the "normalized image pair": both the
+        # reference and the aligned-new image after shadow removal. When a
+        # Module 2 processor is wired in, both detection paths (A ground and
+        # B objects) run on the shadow-removed BGR pair. Without Module 2 we
+        # fall back to the raw aligned pair so the deterministic, AI-free path
+        # (and its tests) keep working unchanged.
+        ref_for_detection = reference_bgr
+        new_for_detection = aligned_bgr
         if self.module2_processor is not None:
             try:
                 module2_payload = self.module2_processor.process_pair_for_module3(reference_bgr, aligned_bgr)
+                ref_for_detection = module2_payload["debug"]["a_final_bgr"]
+                new_for_detection = module2_payload["debug"]["b_final_bgr"]
                 debug_info["module2_used"] = True
+                debug_info["detection_input"] = "module2_shadow_removed"
             except Exception as e:
                 LOGGER.warning(f"Module 2 failed: {e}")
                 debug_info["module2_error"] = str(e)
+                debug_info["detection_input"] = "raw_aligned_module2_failed"
+        else:
+            debug_info["detection_input"] = "raw_aligned"
 
         ground = self._detect_ground(
-            reference_bgr,
-            aligned_bgr,
+            ref_for_detection,
+            new_for_detection,
             valid_mask,
             alignment_confidence=alignment_score,
             module2_payload=module2_payload,
         )
         objects = self._detect_objects(
-            reference_bgr,
-            aligned_bgr,
+            ref_for_detection,
+            new_for_detection,
             valid_mask,
             alignment_confidence=alignment_score,
             debug_info=debug_info,

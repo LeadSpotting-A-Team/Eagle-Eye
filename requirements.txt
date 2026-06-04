@@ -14,5 +14,6 @@ six==1.17.0
 wheel==0.47.0
 scikit-image>=0.21.0
 scipy>=1.11.0
+ultralytics>=8.0.0
 
 
