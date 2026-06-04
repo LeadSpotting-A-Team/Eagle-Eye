@@ -3,21 +3,23 @@
 !/sandbox/.gitkeep
 
 # --- Security & Config ---
-.env            # Secrets and credentials
-*.pem           # Security certificates
+.env
+*.pem
 *.key
 
-# --- Virtual Environments ---
+# --- Virtual Environments (recreate on each machine) ---
 .venv/
+.venv-train/
 venv/
 env/
 ENV/
+.python312/
 
 # --- Python Cache ---
-__pycache__/    # Compiled bytecode
+__pycache__/
 *.py[cod]
 .pytest_cache/
-.coverage       # Test reports
+.coverage
 
 # --- Build & Distribution ---
 dist/
@@ -25,7 +27,40 @@ build/
 *.egg-info/
 
 # --- IDE & System ---
-.vscode/        # Editor settings
-.idea/          # PyCharm settings
-.DS_Store       # macOS system files
-Thumbs.db       # Windows thumbnails
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+# YOLO / Ultralytics — ignore bulk, keep trained model for inference
+# =============================================================================
+
+# Pretrained downloads (not needed when using trained best.pt)
+yolov8s-obb.pt
+yolo26n.pt
+yolo11*.pt
+yolo12*.pt
+yolo26*.pt
+
+# Ultralytics download cache at repo root only (NOT runs/.../weights/)
+/weights/
+
+# Training datasets (large — download only if re-training)
+/datasets/
+datasets/
+Datasets/DOTAv1/
+
+# Training run artifacts — keep only best.pt + args.yaml
+runs/*
+!runs/obb_yolov8s_dota/
+runs/obb_yolov8s_dota/*
+!runs/obb_yolov8s_dota/weights/
+runs/obb_yolov8s_dota/weights/*
+!runs/obb_yolov8s_dota/weights/best.pt
+!runs/obb_yolov8s_dota/args.yaml
+
+# Weight files: ignore by default, allow Eagle-Eye + trained OBB model
+*.pt
+!yolov8s.pt
+!runs/obb_yolov8s_dota/weights/best.pt
