@@ -142,24 +142,47 @@ class YoloDetector(ObjectDetector):
         results = self._model(image_bgr, conf=self._conf, verbose=False)
         detections: list[ObjectDetection] = []
         for result in results:
-            if result.boxes is None:
-                continue
-            for box in result.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-                cls_id = int(box.cls[0].item())
-                cls_name = (
-                    result.names[cls_id] if result.names and cls_id in result.names else "unknown"
-                )
-                conf = float(box.conf[0].item())
-                detections.append(
-                    ObjectDetection(
-                        bbox=(x, y, w, h),
-                        class_id=cls_id,
-                        class_name=cls_name,
-                        confidence=conf,
+            if result.boxes is not None:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+                    cls_id = int(box.cls[0].item())
+                    cls_name = (
+                        result.names[cls_id]
+                        if result.names and cls_id in result.names
+                        else "unknown"
                     )
-                )
+                    conf = float(box.conf[0].item())
+                    detections.append(
+                        ObjectDetection(
+                            bbox=(x, y, w, h),
+                            class_id=cls_id,
+                            class_name=cls_name,
+                            confidence=conf,
+                        )
+                    )
+            elif result.obb is not None:
+                for obb in result.obb:
+                    corners = obb.xyxyxyxy[0].tolist()
+                    xs = [p[0] for p in corners]
+                    ys = [p[1] for p in corners]
+                    x, y = int(min(xs)), int(min(ys))
+                    w, h = int(max(xs) - x), int(max(ys) - y)
+                    cls_id = int(obb.cls[0].item())
+                    cls_name = (
+                        result.names[cls_id]
+                        if result.names and cls_id in result.names
+                        else "unknown"
+                    )
+                    conf = float(obb.conf[0].item())
+                    detections.append(
+                        ObjectDetection(
+                            bbox=(x, y, w, h),
+                            class_id=cls_id,
+                            class_name=cls_name,
+                            confidence=conf,
+                        )
+                    )
         return detections
 
 
